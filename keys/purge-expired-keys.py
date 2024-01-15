@@ -46,13 +46,12 @@ import sys
 import getopt
 import datetime
 import os
-
+import threading
+import logging
 
 listKeys = 0
 deleteKeys = 0
 dumpJSON = False
-listedKeys = 0
-deletedKeys = 0
 includeJWTsessions = 0
 
 maxAge = -1
@@ -62,6 +61,9 @@ delpol = None
 delapi = None
 orgid = None
 redisPassword = None
+
+# Use logger instead of print so output from threads does not get interleaved
+logging.basicConfig(format='%(message)s', level=logging.INFO, stream=sys.stdout)
 
 scriptName = os.path.basename(__file__)
 
@@ -126,16 +128,16 @@ if not orgid:
 
 def shoulddel(apikey, apiid, polid, orgid):
     if orgid != apikey['org_id']:
-        # print(f"Orgid mismatch: {orgid!r} != {apikey['org_id']!r}")
+        # logging.info(f"Orgid mismatch: {orgid!r} != {apikey['org_id']!r}")
         return False
     if apiid is not None:
         if apiid not in apikey['access_rights']:
-            # print(f"apiid mismatch: {apiid!r} not in {apikey['access_rights']!r}")
+            # logging.info(f"apiid mismatch: {apiid!r} not in {apikey['access_rights']!r}")
             return False
     if polid is not None:
         if apikey['apply_policies'] is not None:
             if polid not in apikey['apply_policies']:
-                # print(f"polid mismatch: {polid} not in {apikey['apply_policies']!r}")
+                # logging.info(f"polid mismatch: {polid} not in {apikey['apply_policies']!r}")
                 return False
         else:
             # polid is defined but the apikey has no policy. No match
@@ -146,55 +148,115 @@ def shoulddel(apikey, apiid, polid, orgid):
         return False
     return True
 
-print(f"Attempting to connect to redis on {host}:{port}")
+logging.info(f"Attempting to connect to redis on {host}:{port}")
 r = redis.StrictRedis(host=host, port=port, db=0, password=redisPassword)
-rep = r.info('Replication')
+info = r.info()
+logging.info(f"Keys: {info['db0']['keys']}")
+
+rep = info('Replication')
 if 'role' in rep:
     role=rep['role']
     if role == 'slave':
-        print(f"[FATAL]Node is a replica, must connect to a master node {rep['master_host']}:{rep['master_port']}")
+        logging.info(f"[FATAL]Node is a replica, must connect to a master node {rep['master_host']}:{rep['master_port']}")
         sys.exit(2)
 
 maxDateTime = datetime.datetime.fromtimestamp( maxAge )
-print(f"Searching for keys that expired before {maxAge}, ({maxDateTime})")
+logging.info(f"Searching for keys that expired before {maxAge}, ({maxDateTime})")
 
-for key in r.scan_iter("apikey-*"):
-    apikey = json.loads(r.get(key))
-    keyString = key.decode('utf-8')
-    expires = int(apikey["expires"])
-    if maxAge > 0:
-        # ignore the ones with 'expires' less than or equal to 0, they are the non-expiring apikeys
-        if expires <= 0:
-            # skip because this is a non-expiring key
-            next
-        elif expires <= maxAge:
-            if shoulddel(apikey, delapi, delpol, orgid):
-                if listKeys:
-                    listedKeys += 1
-                    expiresDateTime = datetime.datetime.fromtimestamp( expires )
-                    print(f"{keyString} expires {expires} ({expiresDateTime}) <= {maxAge} ({maxDateTime})")
-                    if dumpJSON:
-                        print(json.dumps(apikey, indent=4, sort_keys=True))
-                else:
-                    # expiresDateTime = datetime.datetime.fromtimestamp( expires )
-                    # print(f"Deleting: {keyString} expires {expires} ({expiresDateTime}) <= {maxAge} ({maxDateTime})")
-                    r.delete(key)
-                    deletedKeys += 1
+def execute_pipeline(get_pipeline, del_pipeline, keys_to_get):
+    deletedKeys = 0
+    pipeline_size = 0
+    values = get_pipeline.execute()
+    for i in range(0, len(keys_to_get)):
+        apikey = json.loads(values[i])
+        key = keys_to_get[i]
+        keyString = key.decode('utf-8')
+        expires = int(apikey["expires"])
+        if maxAge > 0:
+            # ignore the ones with 'expires' less than or equal to 0, they are the non-expiring api keys
+            if expires <= 0:
+                # skip because this is a non-expiring key
+                continue
+            elif expires <= maxAge:
+                if shoulddel(apikey, delapi, delpol, orgid):
+                    if listKeys:
+                        deletedKeys += 1
+                        expiresDateTime = datetime.datetime.fromtimestamp( expires )
+                        logging.info(f"{keyString} expires {expires} ({expiresDateTime}) <= {maxAge} ({maxDateTime}) {apikey["alias"]}")
+                        if dumpJSON:
+                            logging.info(json.dumps(apikey, indent=4, sort_keys=True))
+                    else:
+                        expiresDateTime = datetime.datetime.fromtimestamp( expires )
+                        logging.info(f"Deleting: {keyString} expires {expires} ({expiresDateTime}) <= {maxAge} ({maxDateTime}) {apikey["alias"]}")
+                        del_pipeline.delete(key)
+                        deletedKeys += 1
+                        pipeline_size += 1
+        else:
+            # list or delete all the non-expiring keys (maxAge == 0 and expires <= 0)
+            if expires <= 0:
+                if shoulddel(apikey, delapi, delpol, orgid):
+                    if listKeys:
+                        deletedKeys += 1
+                        logging.info(keyString, expires, '<=', maxAge)
+                        if dumpJSON:
+                            logging.info(json.dumps(apikey, indent=4, sort_keys=True))
+                    else:
+                        logging.info('Deleting: ', keyString, expires, '<=', maxAge)
+                        r.delete(key)
+                        deletedKeys += 1
+    if pipeline_size > 0:
+        del_pipeline.execute()
+    return deletedKeys
+
+
+def iterate_keys(stop_event, prefix):
+
+    total = 0
+    deletedKeys = 0
+
+    get_pipeline = r.pipeline(transaction=False)
+    del_pipeline = r.pipeline(transaction=False)
+    keys_to_get = []
+
+    for key in r.scan_iter(match="apikey-"+prefix+"*", count=5000):
+        # Check for stop event to exit the thread
+        if stop_event.is_set():
+            logging.info(f"Exiting thread {prefix} after processing {total} keys")
+            del_pipeline.execute()
+            return
+
+        total += 1
+        get_pipeline.get(key)
+        keys_to_get.append(key)
+        if len(keys_to_get) < 100:
+            continue
+        deletedKeys = deletedKeys + execute_pipeline(get_pipeline, del_pipeline, keys_to_get)
+        keys_to_get = []
+    deletedKeys = deletedKeys + execute_pipeline(get_pipeline, del_pipeline, keys_to_get)
+
+    logging.info(f"{total} total keys")
+    if listKeys:
+        logging.info(f"{deletedKeys} keys listed")
     else:
-        # list or delete all the non-expiring keys (maxAge == 0 and expires <= 0)
-        if expires <= 0:
-            if shoulddel(apikey, delapi, delpol, orgid):
-                if listKeys:
-                    listedKeys += 1
-                    print(keyString, expires, '<=', maxAge)
-                    if dumpJSON:
-                        print(json.dumps(apikey, indent=4, sort_keys=True))
-                else:
-                    # print('Deleting: ', keyString, expires, '<=', maxAge)
-                    r.delete(key)
-                    deletedKeys += 1
+        logging.info(f"{deletedKeys} keys deleted")
 
-if listKeys:
-    print(listedKeys, 'keys listed')
-else:
-    print(deletedKeys, 'keys deleted')
+kill_event = threading.Event()
+threads = []
+
+for i in range(0, 16):
+    prefix = hex(i)[2:]
+    x = threading.Thread(target=iterate_keys, args=(kill_event, prefix))
+    threads.append(x)
+
+for t in threads:
+    t.start()
+
+try:
+    for t in threads:
+        t.join()
+    logging.info("All threads finished")
+except:
+    logging.info('User exit requested')
+    kill_event.set()
+    for t in threads:
+        t.join()
